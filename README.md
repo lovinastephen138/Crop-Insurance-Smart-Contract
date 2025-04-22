@@ -85,27 +85,3 @@ clarinet console
 ```
 
 Then you can execute contract calls to test the functionality.
-```
-
-Git commit message:
-```
-Implement crop insurance smart contract with weather-based payouts
-```
-
-GitHub Pull Request title:
-```
-Add crop insurance smart contract MVP
-```
-
-GitHub Pull Request description:
-```
-This PR introduces a new crop insurance smart contract that allows farmers to purchase insurance policies and receive automatic payouts based on weather data.
-
-Key features:
-- Farmer registration system
-- Policy purchase with customizable coverage
-- Oracle-based weather data submission
-- Automatic payout calculation based on drought conditions
-- Admin functions for managing regions and crops
-
-The contract implements a simple but effective payout model based on drought index thresholds, with higher drought indices triggering larger payouts. All core functionality is implemented and ready for testing.
