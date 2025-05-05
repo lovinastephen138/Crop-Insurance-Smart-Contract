@@ -280,3 +280,109 @@
     )
   )
 )
+
+
+
+(define-constant season-discount-rate u20)
+
+(define-map multi-season-policies 
+  { farmer: principal, bundle-id: uint }
+  {
+    policy-ids: (list 10 uint),
+    seasons: uint,
+    total-premium: uint,
+    active: bool
+  }
+)
+
+(define-public (purchase-multi-season-insurance 
+    (region-id uint) 
+    (crop-id uint) 
+    (premium-per-season uint) 
+    (coverage-per-season uint)
+    (season-count uint)
+    (blocks-per-season uint))
+  (let (
+    (bundle-discount (/ (* premium-per-season season-discount-rate) u100))
+    (discounted-premium-per-season (- premium-per-season bundle-discount))
+    (total-premium (* discounted-premium-per-season season-count))
+    (policy-ids (list u0))
+  )
+    (asserts! (>= season-count u2) err-invalid-amount)
+    (asserts! (<= season-count u10) err-invalid-amount)
+    
+    (try! (stx-transfer? total-premium tx-sender (as-contract tx-sender)))
+    
+    (var-set total-stx-pool (+ (var-get total-stx-pool) total-premium))
+    
+    (let ((bundle-id (get-next-policy-id tx-sender)))
+      (map-set multi-season-policies
+        { farmer: tx-sender, bundle-id: bundle-id }
+        {
+          policy-ids: policy-ids,
+          seasons: season-count,
+          total-premium: total-premium,
+          active: true
+        }
+      )
+      (ok bundle-id)
+    )
+  )
+)
+
+
+(define-constant min-stake-amount u1000000000)
+(define-constant staking-fee-percent u5)
+
+(define-map stakers
+  principal
+  {
+    staked-amount: uint,
+    rewards-claimed: uint,
+    last-reward-block: uint
+  }
+)
+
+(define-data-var total-staked-amount uint u0)
+
+(define-public (stake-tokens (amount uint))
+  (let (
+    (staker-info (default-to 
+      { staked-amount: u0, rewards-claimed: u0, last-reward-block: stacks-block-height }
+      (map-get? stakers tx-sender)))
+  )
+    (asserts! (>= amount min-stake-amount) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set stakers tx-sender {
+      staked-amount: (+ (get staked-amount staker-info) amount),
+      rewards-claimed: (get rewards-claimed staker-info),
+      last-reward-block: stacks-block-height
+    })
+    
+    (var-set total-staked-amount (+ (var-get total-staked-amount) amount))
+    (ok true)
+  )
+)
+
+(define-private (calculate-staking-reward (staked-amount uint) (blocks uint))
+  (/ (* staked-amount blocks staking-fee-percent) u10000))
+
+(define-public (claim-staking-rewards)
+  (let (
+    (staker-info (unwrap! (map-get? stakers tx-sender) err-not-registered))
+    (blocks-elapsed (- stacks-block-height (get last-reward-block staker-info)))
+    (reward-amount (calculate-staking-reward 
+      (get staked-amount staker-info)
+      blocks-elapsed))
+  )
+    (try! (as-contract (stx-transfer? reward-amount (as-contract tx-sender) tx-sender)))
+    
+    (map-set stakers tx-sender {
+      staked-amount: (get staked-amount staker-info),
+      rewards-claimed: (+ (get rewards-claimed staker-info) reward-amount),
+      last-reward-block: stacks-block-height
+    })
+    (ok reward-amount)
+  )
+)
