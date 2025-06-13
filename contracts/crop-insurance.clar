@@ -17,6 +17,15 @@
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 (define-data-var total-stx-pool uint u0)
 
+(define-constant err-insufficient-data (err u200))
+(define-constant err-invalid-risk-params (err u201))
+(define-constant err-risk-too-high (err u202))
+
+(define-data-var base-premium-rate uint u100)
+(define-data-var max-risk-multiplier uint u500)
+(define-data-var min-data-points uint u5)
+
+
 (define-map regions uint {
   name: (string-ascii 20),
   active: bool
@@ -384,5 +393,202 @@
       last-reward-block: stacks-block-height
     })
     (ok reward-amount)
+  )
+)
+
+
+
+(define-map regional-risk-factors
+  uint
+  {
+    drought-frequency: uint,
+    flood-frequency: uint,
+    temperature-volatility: uint,
+    historical-claims-ratio: uint,
+    last-updated: uint
+  }
+)
+
+(define-map crop-risk-multipliers
+  uint
+  {
+    base-multiplier: uint,
+    drought-sensitivity: uint,
+    flood-sensitivity: uint,
+    temperature-sensitivity: uint
+  }
+)
+
+(define-map historical-weather-summary
+  { region-id: uint, year: uint }
+  {
+    avg-drought-index: uint,
+    extreme-weather-events: uint,
+    total-rainfall: uint,
+    avg-temperature: uint,
+    data-points: uint
+  }
+)
+
+(define-read-only (get-regional-risk (region-id uint))
+  (map-get? regional-risk-factors region-id)
+)
+
+(define-read-only (get-crop-risk-multiplier (crop-id uint))
+  (map-get? crop-risk-multipliers crop-id)
+)
+
+(define-read-only (calculate-risk-score (region-id uint) (crop-id uint))
+  (let (
+    (regional-risk (unwrap! (get-regional-risk region-id) err-insufficient-data))
+    (crop-multiplier (unwrap! (get-crop-risk-multiplier crop-id) err-insufficient-data))
+  )
+    (let (
+      (drought-risk (* (get drought-frequency regional-risk) (get drought-sensitivity crop-multiplier)))
+      (flood-risk (* (get flood-frequency regional-risk) (get flood-sensitivity crop-multiplier)))
+      (temp-risk (* (get temperature-volatility regional-risk) (get temperature-sensitivity crop-multiplier)))
+      (base-risk (get base-multiplier crop-multiplier))
+    )
+      (ok (+ base-risk (/ (+ drought-risk flood-risk temp-risk) u300)))
+    )
+  )
+)
+
+(define-read-only (calculate-dynamic-premium (coverage-amount uint) (region-id uint) (crop-id uint))
+  (let (
+    (risk-score (unwrap! (calculate-risk-score region-id crop-id) err-insufficient-data))
+  )
+    (asserts! (<= risk-score (var-get max-risk-multiplier)) err-risk-too-high)
+    (let (
+      (base-premium (/ (* coverage-amount (var-get base-premium-rate)) u10000))
+      (risk-adjusted-premium (/ (* base-premium risk-score) u100))
+    )
+      (ok risk-adjusted-premium)
+    )
+  )
+)
+
+(define-public (set-regional-risk-factors 
+    (region-id uint)
+    (drought-freq uint)
+    (flood-freq uint) 
+    (temp-volatility uint)
+    (claims-ratio uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set regional-risk-factors region-id {
+      drought-frequency: drought-freq,
+      flood-frequency: flood-freq,
+      temperature-volatility: temp-volatility,
+      historical-claims-ratio: claims-ratio,
+      last-updated: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (set-crop-risk-multiplier
+    (crop-id uint)
+    (base-mult uint)
+    (drought-sens uint)
+    (flood-sens uint)
+    (temp-sens uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set crop-risk-multipliers crop-id {
+      base-multiplier: base-mult,
+      drought-sensitivity: drought-sens,
+      flood-sensitivity: flood-sens,
+      temperature-sensitivity: temp-sens
+    })
+    (ok true)
+  )
+)
+
+(define-public (update-historical-data 
+    (region-id uint)
+    (year uint)
+    (avg-drought uint)
+    (extreme-events uint)
+    (total-rain uint)
+    (avg-temp uint)
+    (data-count uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get oracle-address)) err-owner-only)
+    (asserts! (>= data-count (var-get min-data-points)) err-insufficient-data)
+    (map-set historical-weather-summary 
+      { region-id: region-id, year: year }
+      {
+        avg-drought-index: avg-drought,
+        extreme-weather-events: extreme-events,
+        total-rainfall: total-rain,
+        avg-temperature: avg-temp,
+        data-points: data-count
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-smart-insurance (region-id uint) (crop-id uint) (coverage-amount uint) (duration uint))
+  (let (
+    (farmer-info (get-farmer-info tx-sender))
+    (region (get-region region-id))
+    (crop (get-crop crop-id))
+    (calculated-premium (unwrap! (calculate-dynamic-premium coverage-amount region-id crop-id) err-insufficient-data))
+    (policy-id (get-next-policy-id tx-sender))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get registered farmer-info) err-not-registered)
+    (asserts! (is-some region) err-invalid-region)
+    (asserts! (is-some crop) err-invalid-crop)
+    (asserts! (>= calculated-premium (var-get min-premium-amount)) err-invalid-amount)
+    
+    (try! (stx-transfer? calculated-premium tx-sender (as-contract tx-sender)))
+    
+    (var-set total-stx-pool (+ (var-get total-stx-pool) calculated-premium))
+    
+    (map-set policies 
+      { farmer: tx-sender, policy-id: policy-id } 
+      {
+        region-id: region-id,
+        crop-id: crop-id,
+        premium-amount: calculated-premium,
+        coverage-amount: coverage-amount,
+        start-block: current-block,
+        end-block: (+ current-block duration),
+        claimed: false
+      }
+    )
+    
+    (map-set policy-counter tx-sender (+ policy-id u1))
+    
+    (map-set farmers tx-sender {
+      registered: true,
+      total-premiums-paid: (+ (get total-premiums-paid farmer-info) calculated-premium),
+      total-claims-received: (get total-claims-received farmer-info)
+    })
+    
+    (ok { policy-id: policy-id, premium-paid: calculated-premium })
+  )
+)
+
+(define-public (get-premium-quote (coverage-amount uint) (region-id uint) (crop-id uint))
+  (calculate-dynamic-premium coverage-amount region-id crop-id)
+)
+
+(define-public (set-base-premium-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set base-premium-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (set-max-risk-multiplier (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set max-risk-multiplier new-max)
+    (ok true)
   )
 )
