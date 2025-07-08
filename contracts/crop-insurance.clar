@@ -20,6 +20,9 @@
 (define-constant err-insufficient-data (err u200))
 (define-constant err-invalid-risk-params (err u201))
 (define-constant err-risk-too-high (err u202))
+(define-constant err-transfer-not-allowed (err u203))
+(define-constant err-not-policy-owner (err u204))
+(define-constant err-policy-already-claimed (err u205))
 
 (define-data-var base-premium-rate uint u100)
 (define-data-var max-risk-multiplier uint u500)
@@ -76,6 +79,16 @@
   }
 )
 
+(define-map policy-transfer-requests
+  { from-farmer: principal, policy-id: uint }
+  {
+    to-farmer: principal,
+    transfer-price: uint,
+    expires-at-block: uint,
+    active: bool
+  }
+)
+
 (define-read-only (get-farmer-info (farmer principal))
   (default-to 
     { registered: false, total-premiums-paid: u0, total-claims-received: u0 }
@@ -105,6 +118,10 @@
 
 (define-read-only (get-next-policy-id (farmer principal))
   (default-to u1 (map-get? policy-counter farmer))
+)
+
+(define-read-only (get-transfer-request (from-farmer principal) (policy-id uint))
+  (map-get? policy-transfer-requests { from-farmer: from-farmer, policy-id: policy-id })
 )
 
 (define-public (register-farmer)
@@ -590,5 +607,84 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (var-set max-risk-multiplier new-max)
     (ok true)
+  )
+)
+
+(define-public (create-transfer-request (policy-id uint) (to-farmer principal) (transfer-price uint) (expiry-blocks uint))
+  (let (
+    (policy (get-policy tx-sender policy-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-some policy) err-no-policy)
+    (let ((policy-data (unwrap-panic policy)))
+      (asserts! (not (get claimed policy-data)) err-policy-already-claimed)
+      (asserts! (> (get end-block policy-data) current-block) err-not-claimable)
+      (asserts! (get registered (get-farmer-info to-farmer)) err-not-registered)
+      
+      (map-set policy-transfer-requests 
+        { from-farmer: tx-sender, policy-id: policy-id }
+        {
+          to-farmer: to-farmer,
+          transfer-price: transfer-price,
+          expires-at-block: (+ current-block expiry-blocks),
+          active: true
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (accept-transfer-request (from-farmer principal) (policy-id uint))
+  (let (
+    (transfer-request (get-transfer-request from-farmer policy-id))
+    (policy (get-policy from-farmer policy-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-some transfer-request) err-transfer-not-allowed)
+    (asserts! (is-some policy) err-no-policy)
+    
+    (let (
+      (request-data (unwrap-panic transfer-request))
+      (policy-data (unwrap-panic policy))
+    )
+      (asserts! (get active request-data) err-transfer-not-allowed)
+      (asserts! (< current-block (get expires-at-block request-data)) err-transfer-not-allowed)
+      (asserts! (is-eq tx-sender (get to-farmer request-data)) err-not-policy-owner)
+      (asserts! (not (get claimed policy-data)) err-policy-already-claimed)
+      
+      (try! (stx-transfer? (get transfer-price request-data) tx-sender from-farmer))
+      
+      (map-set policies 
+        { farmer: tx-sender, policy-id: policy-id }
+        policy-data
+      )
+      
+      (map-delete policies { farmer: from-farmer, policy-id: policy-id })
+      
+      (map-set policy-transfer-requests 
+        { from-farmer: from-farmer, policy-id: policy-id }
+        (merge request-data { active: false })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (cancel-transfer-request (policy-id uint))
+  (let (
+    (transfer-request (get-transfer-request tx-sender policy-id))
+  )
+    (asserts! (is-some transfer-request) err-transfer-not-allowed)
+    (let ((request-data (unwrap-panic transfer-request)))
+      (asserts! (get active request-data) err-transfer-not-allowed)
+      
+      (map-set policy-transfer-requests 
+        { from-farmer: tx-sender, policy-id: policy-id }
+        (merge request-data { active: false })
+      )
+      (ok true)
+    )
   )
 )
