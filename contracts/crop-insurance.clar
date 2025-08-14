@@ -23,10 +23,23 @@
 (define-constant err-transfer-not-allowed (err u203))
 (define-constant err-not-policy-owner (err u204))
 (define-constant err-policy-already-claimed (err u205))
+(define-constant err-pool-not-found (err u206))
+(define-constant err-already-in-pool (err u207))
+(define-constant err-not-in-pool (err u208))
+(define-constant err-pool-full (err u209))
+(define-constant err-insufficient-votes (err u210))
+(define-constant err-voting-closed (err u211))
+(define-constant err-already-voted (err u212))
 
 (define-data-var base-premium-rate uint u100)
 (define-data-var max-risk-multiplier uint u500)
 (define-data-var min-data-points uint u5)
+
+;; Cooperative pool constants
+(define-constant max-pool-size u10)
+(define-constant min-pool-size u3)
+(define-constant pool-discount-rate u15)
+(define-constant voting-period-blocks u1440)
 
 
 (define-map regions uint {
@@ -89,6 +102,56 @@
   }
 )
 
+;; Cooperative pool data structures
+(define-map cooperative-pools
+  uint
+  {
+    name: (string-ascii 30),
+    creator: principal,
+    region-id: uint,
+    crop-id: uint,
+    members: (list 10 principal),
+    member-count: uint,
+    total-premium-pool: uint,
+    active: bool,
+    created-block: uint
+  }
+)
+
+(define-map pool-membership
+  principal
+  {
+    pool-id: uint,
+    joined-block: uint,
+    contribution: uint
+  }
+)
+
+(define-map pool-claim-votes
+  { pool-id: uint, claim-id: uint, voter: principal }
+  {
+    vote: bool,
+    voted-block: uint
+  }
+)
+
+(define-map pool-claims
+  { pool-id: uint, claim-id: uint }
+  {
+    claimer: principal,
+    amount: uint,
+    policy-id: uint,
+    votes-for: uint,
+    votes-against: uint,
+    voting-ends: uint,
+    executed: bool,
+    created-block: uint
+  }
+)
+
+(define-data-var pool-counter uint u0)
+(define-data-var pool-claim-counter uint u0)
+
 (define-read-only (get-farmer-info (farmer principal))
   (default-to 
     { registered: false, total-premiums-paid: u0, total-claims-received: u0 }
@@ -122,6 +185,23 @@
 
 (define-read-only (get-transfer-request (from-farmer principal) (policy-id uint))
   (map-get? policy-transfer-requests { from-farmer: from-farmer, policy-id: policy-id })
+)
+
+;; Cooperative pool read-only functions
+(define-read-only (get-cooperative-pool (pool-id uint))
+  (map-get? cooperative-pools pool-id)
+)
+
+(define-read-only (get-pool-membership (farmer principal))
+  (map-get? pool-membership farmer)
+)
+
+(define-read-only (get-pool-claim (pool-id uint) (claim-id uint))
+  (map-get? pool-claims { pool-id: pool-id, claim-id: claim-id })
+)
+
+(define-read-only (get-next-pool-id)
+  (+ (var-get pool-counter) u1)
 )
 
 (define-public (register-farmer)
@@ -688,3 +768,264 @@
     )
   )
 )
+
+;; Cooperative insurance pool functions
+(define-public (create-cooperative-pool (name (string-ascii 30)) (region-id uint) (crop-id uint))
+  (let (
+    (farmer-info (get-farmer-info tx-sender))
+    (pool-id (get-next-pool-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get registered farmer-info) err-not-registered)
+    (asserts! (is-some (get-region region-id)) err-invalid-region)
+    (asserts! (is-some (get-crop crop-id)) err-invalid-crop)
+    (asserts! (is-none (get-pool-membership tx-sender)) err-already-in-pool)
+    
+    ;; Create the pool with creator as first member
+    (map-set cooperative-pools pool-id {
+      name: name,
+      creator: tx-sender,
+      region-id: region-id,
+      crop-id: crop-id,
+      members: (list tx-sender),
+      member-count: u1,
+      total-premium-pool: u0,
+      active: true,
+      created-block: current-block
+    })
+    
+    ;; Set creator's membership
+    (map-set pool-membership tx-sender {
+      pool-id: pool-id,
+      joined-block: current-block,
+      contribution: u0
+    })
+    
+    (var-set pool-counter pool-id)
+    (ok pool-id)
+  )
+)
+
+(define-public (join-cooperative-pool (pool-id uint))
+  (let (
+    (farmer-info (get-farmer-info tx-sender))
+    (pool-info (get-cooperative-pool pool-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get registered farmer-info) err-not-registered)
+    (asserts! (is-some pool-info) err-pool-not-found)
+    (asserts! (is-none (get-pool-membership tx-sender)) err-already-in-pool)
+    
+    (let ((pool-data (unwrap-panic pool-info)))
+      (asserts! (get active pool-data) err-pool-not-found)
+      (asserts! (< (get member-count pool-data) max-pool-size) err-pool-full)
+      
+      ;; Add member to pool
+      (map-set cooperative-pools pool-id 
+        (merge pool-data {
+          members: (unwrap-panic (as-max-len? (append (get members pool-data) tx-sender) u10)),
+          member-count: (+ (get member-count pool-data) u1)
+        })
+      )
+      
+      ;; Set member's pool info
+      (map-set pool-membership tx-sender {
+        pool-id: pool-id,
+        joined-block: current-block,
+        contribution: u0
+      })
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (leave-cooperative-pool)
+  (let (
+    (membership (get-pool-membership tx-sender))
+  )
+    (asserts! (is-some membership) err-not-in-pool)
+    (let (
+      (member-data (unwrap-panic membership))
+      (pool-id (get pool-id member-data))
+      (pool-info (unwrap! (get-cooperative-pool pool-id) err-pool-not-found))
+    )
+      ;; Remove member from pool
+      (map-set cooperative-pools pool-id 
+        (merge pool-info {
+          members: (filter remove-member (get members pool-info)),
+          member-count: (- (get member-count pool-info) u1)
+        })
+      )
+      
+      ;; Remove membership record
+      (map-delete pool-membership tx-sender)
+      (ok true)
+    )
+  )
+)
+
+;; Helper function to remove member from list
+(define-private (remove-member (member principal))
+  (not (is-eq member tx-sender))
+)
+
+(define-public (contribute-to-pool (amount uint))
+  (let (
+    (membership (get-pool-membership tx-sender))
+  )
+    (asserts! (is-some membership) err-not-in-pool)
+    (asserts! (>= amount (var-get min-premium-amount)) err-invalid-amount)
+    
+    (let (
+      (member-data (unwrap-panic membership))
+      (pool-id (get pool-id member-data))
+      (pool-info (unwrap! (get-cooperative-pool pool-id) err-pool-not-found))
+    )
+      ;; Transfer STX to contract
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      
+      ;; Update pool total
+      (map-set cooperative-pools pool-id 
+        (merge pool-info {
+          total-premium-pool: (+ (get total-premium-pool pool-info) amount)
+        })
+      )
+      
+      ;; Update member contribution
+      (map-set pool-membership tx-sender 
+        (merge member-data {
+          contribution: (+ (get contribution member-data) amount)
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (submit-pool-claim (policy-id uint) (claim-amount uint))
+  (let (
+    (membership (get-pool-membership tx-sender))
+    (policy (get-policy tx-sender policy-id))
+  )
+    (asserts! (is-some membership) err-not-in-pool)
+    (asserts! (is-some policy) err-no-policy)
+    
+    (let (
+      (member-data (unwrap-panic membership))
+      (pool-id (get pool-id member-data))
+      (policy-data (unwrap-panic policy))
+      (claim-id (+ (var-get pool-claim-counter) u1))
+      (current-block stacks-block-height)
+    )
+      (asserts! (not (get claimed policy-data)) err-already-claimed)
+      (asserts! (<= claim-amount (get coverage-amount policy-data)) err-invalid-amount)
+      
+      ;; Create claim for voting
+      (map-set pool-claims 
+        { pool-id: pool-id, claim-id: claim-id }
+        {
+          claimer: tx-sender,
+          amount: claim-amount,
+          policy-id: policy-id,
+          votes-for: u0,
+          votes-against: u0,
+          voting-ends: (+ current-block voting-period-blocks),
+          executed: false,
+          created-block: current-block
+        }
+      )
+      
+      (var-set pool-claim-counter claim-id)
+      (ok claim-id)
+    )
+  )
+)
+
+(define-public (vote-on-claim (pool-id uint) (claim-id uint) (vote bool))
+  (let (
+    (membership (get-pool-membership tx-sender))
+    (claim-info (get-pool-claim pool-id claim-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-some membership) err-not-in-pool)
+    (asserts! (is-some claim-info) err-pool-not-found)
+    (asserts! (is-eq pool-id (get pool-id (unwrap-panic membership))) err-not-in-pool)
+    
+    (let ((claim-data (unwrap-panic claim-info)))
+      (asserts! (< current-block (get voting-ends claim-data)) err-voting-closed)
+      (asserts! (not (get executed claim-data)) err-already-claimed)
+      
+      ;; Check if already voted
+      (asserts! (is-none (map-get? pool-claim-votes { pool-id: pool-id, claim-id: claim-id, voter: tx-sender })) 
+               err-already-voted)
+      
+      ;; Record vote
+      (map-set pool-claim-votes 
+        { pool-id: pool-id, claim-id: claim-id, voter: tx-sender }
+        {
+          vote: vote,
+          voted-block: current-block
+        }
+      )
+      
+      ;; Update claim vote counts
+      (map-set pool-claims 
+        { pool-id: pool-id, claim-id: claim-id }
+        (if vote
+          (merge claim-data { votes-for: (+ (get votes-for claim-data) u1) })
+          (merge claim-data { votes-against: (+ (get votes-against claim-data) u1) })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (execute-pool-claim (pool-id uint) (claim-id uint))
+  (let (
+    (claim-info (get-pool-claim pool-id claim-id))
+    (pool-info (get-cooperative-pool pool-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-some claim-info) err-pool-not-found)
+    (asserts! (is-some pool-info) err-pool-not-found)
+    
+    (let (
+      (claim-data (unwrap-panic claim-info))
+      (pool-data (unwrap-panic pool-info))
+    )
+      (asserts! (>= current-block (get voting-ends claim-data)) err-voting-closed)
+      (asserts! (not (get executed claim-data)) err-already-claimed)
+      
+      ;; Require majority approval (more than half)
+      (let ((required-votes (/ (get member-count pool-data) u2)))
+        (asserts! (> (get votes-for claim-data) required-votes) err-insufficient-votes)
+        (asserts! (>= (get total-premium-pool pool-data) (get amount claim-data)) err-insufficient-funds)
+        
+        ;; Execute payout
+        (try! (as-contract (stx-transfer? (get amount claim-data) (as-contract tx-sender) (get claimer claim-data))))
+        
+        ;; Update pool balance
+        (map-set cooperative-pools pool-id 
+          (merge pool-data {
+            total-premium-pool: (- (get total-premium-pool pool-data) (get amount claim-data))
+          })
+        )
+        
+        ;; Mark claim as executed
+        (map-set pool-claims 
+          { pool-id: pool-id, claim-id: claim-id }
+          (merge claim-data { executed: true })
+        )
+        
+        (ok true)
+      )
+    )
+  )
+)
+
+
+
