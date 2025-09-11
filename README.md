@@ -57,9 +57,18 @@ This smart contract enables farmers to purchase insurance policies for their cro
    (contract-call? .crop-insurance get-policy tx-sender u1)
    ```
 
-4. **Claim insurance** (when eligible)
+4. **Set beneficiary delegate** (optional)
    ```
-   (contract-call? .crop-insurance claim-insurance u1)
+   (contract-call? .crop-insurance set-beneficiary 'SP2ABC...)
+   ```
+
+5. **Claim insurance** (when eligible)
+   ```
+   ;; Farmer claims their own policy
+   (contract-call? .crop-insurance claim-insurance tx-sender u1)
+   
+   ;; Beneficiary claims on farmer's behalf
+   (contract-call? .crop-insurance claim-insurance 'SP1FARMER... u1)
    ```
 
 ## Payout Calculation

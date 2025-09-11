@@ -58,6 +58,8 @@
   total-claims-received: uint
 })
 
+(define-map beneficiaries principal principal)
+
 (define-map policies 
   { farmer: principal, policy-id: uint } 
   {
@@ -204,6 +206,18 @@
   (+ (var-get pool-counter) u1)
 )
 
+(define-read-only (get-beneficiary (farmer principal))
+  (map-get? beneficiaries farmer)
+)
+
+(define-public (set-beneficiary (delegate principal))
+  (let ((farmer-info (get-farmer-info tx-sender)))
+    (asserts! (get registered farmer-info) err-not-registered)
+    (map-set beneficiaries tx-sender delegate)
+    (ok true)
+  )
+)
+
 (define-public (register-farmer)
   (let ((farmer-info (get-farmer-info tx-sender)))
     (if (get registered farmer-info)
@@ -304,13 +318,16 @@
   )
 )
 
-(define-public (claim-insurance (policy-id uint))
+(define-public (claim-insurance (farmer principal) (policy-id uint))
   (let (
-    (farmer tx-sender)
+    (caller tx-sender)
     (policy (get-policy farmer policy-id))
     (farmer-info (get-farmer-info farmer))
   )
     (asserts! (is-some policy) err-no-policy)
+    ;; Verify caller is either the farmer or authorized to claim on their behalf
+    (asserts! (or (is-eq caller farmer)
+                  (is-eq (get-beneficiary farmer) (some caller))) err-not-policy-owner)
     (let (
       (policy-data (unwrap-panic policy))
       (weather-data-entry (get-weather-data (get region-id policy-data) stacks-block-height))
